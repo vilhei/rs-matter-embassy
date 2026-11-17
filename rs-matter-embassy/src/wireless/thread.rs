@@ -24,6 +24,16 @@ use crate::stack::MatterStack;
 
 use super::{ControllerGattPeripheral, EmbassyGatt};
 
+/// The MTU of the `embassy-net` driver of [`EmbassyThread::with_enet`]: IPv6's minimum, which
+/// Thread guarantees.
+#[cfg(feature = "openthread-enet")]
+pub const OT_ENET_MTU: usize = 1280;
+
+/// The OpenThread side of an `embassy-net-driver-channel` driver, see
+/// [`EmbassyThread::with_enet`].
+#[cfg(feature = "openthread-enet")]
+pub type OtEnetRunner<'d> = embassy_net_driver_channel::Runner<'d, OT_ENET_MTU>;
+
 #[cfg(feature = "esp")]
 pub mod esp_thread;
 #[cfg(feature = "nrf")]
@@ -180,6 +190,21 @@ impl<'a, T, K, R> EmbassyThread<'a, T, K, R> {
         self.runner.icd = Some(icd);
         self
     }
+
+    /// Also pass IPv6 packets between OpenThread and the `embassy-net` stack whose driver is
+    /// the other half of `enet`, so that the application can use `embassy-net` sockets (e.g.
+    /// TCP, which `openthread` does not wrap) next to Matter. OpenThread keeps the packets it
+    /// consumes itself (Thread control traffic, its UDP sockets: Matter's); `embassy-net` gets
+    /// the rest and sends through OpenThread.
+    ///
+    /// `embassy-net` must be given one of OpenThread's addresses (e.g. the off-mesh routable
+    /// one) as its static IPv6 address.
+    #[cfg(feature = "openthread-enet")]
+    #[must_use]
+    pub fn with_enet(mut self, enet: &'a mut OtEnetRunner<'a>) -> Self {
+        self.runner.enet = core::cell::RefCell::new(Some(enet));
+        self
+    }
 }
 
 /// A network context for the `EmbassyThread` type.
@@ -229,6 +254,8 @@ pub struct OtThreadRunner<'a, K, R> {
     ble_context: &'a BtpGattContext,
     use_ble_random_addr: bool,
     icd: Option<&'a Icd>,
+    #[cfg(feature = "openthread-enet")]
+    enet: core::cell::RefCell<Option<&'a mut OtEnetRunner<'a>>>,
 }
 
 impl<'a, K, R> OtThreadRunner<'a, K, R> {
@@ -249,7 +276,20 @@ impl<'a, K, R> OtThreadRunner<'a, K, R> {
             ble_context,
             use_ble_random_addr,
             icd: None,
+            #[cfg(feature = "openthread-enet")]
+            enet: core::cell::RefCell::new(None),
         }
+    }
+
+    /// Run OpenThread, and with an `embassy-net` driver (`with_enet`) pass the IPv6 packets
+    /// between the two.
+    async fn run_ot<T: Radio>(&self, ot: &OpenThread<'_>, radio: T) -> ! {
+        #[cfg(feature = "openthread-enet")]
+        if let Some(enet) = self.enet.borrow_mut().as_deref_mut() {
+            run_ot_enet(ot, radio, enet).await
+        }
+
+        ot.run(radio).await
     }
 
     /// Return the GATT peripheral context.
@@ -317,7 +357,7 @@ where
 
         let mut main = pin!(task.run(&net_stack, &netif, &net_ctl, &mut mdns));
         let mut radio = pin!(async {
-            ot.run(radio).await;
+            self.run_ot(&ot, radio).await;
             #[allow(unreachable_code)]
             Ok(())
         });
@@ -382,7 +422,7 @@ where
 
         let mut main = pin!(task.run(&net_stack, &netif, &net_ctl, &mut mdns, &mut gatt));
         let mut radio = pin!(async {
-            ot.run(radio).await;
+            self.run_ot(&ot, radio).await;
             #[allow(unreachable_code)]
             Ok(())
         });
@@ -422,6 +462,50 @@ const CHILD_SUPERVISION_CHECK_TIMEOUT_DEFAULT_S: u32 = 190;
 /// Configure the node as a Sleepy End Device (receiver off when idle, MTD, stable network data
 /// only), with its keep-alives sized as `apply_icd_params` does.
 ///
+/// Run OpenThread and move IPv6 packets between it and `embassy-net`, like
+/// `openthread::enet::EnetRunner` does with an `OpenThread` it owns.
+#[cfg(feature = "openthread-enet")]
+async fn run_ot_enet<R: Radio>(ot: &OpenThread<'_>, radio: R, enet: &mut OtEnetRunner<'_>) -> ! {
+    use crate::matter::utils::futures::{select3, Either3};
+    use embassy_net_driver_channel::driver::LinkState;
+
+    // Without the filter, `embassy-net` would also get Thread's control traffic and the
+    // datagrams for OpenThread's own UDP sockets (Matter's), and answer each one with an ICMP
+    // "port unreachable". `openthread` does not wrap the call. SAFETY: OpenThread is a single
+    // instance, already initialised here, so `otInstanceInitSingle` just returns it; the call
+    // sets a flag and calls back into nothing.
+    unsafe {
+        openthread::sys::otIp6SetReceiveFilterEnabled(openthread::sys::otInstanceInitSingle(), true);
+    }
+    ot.enable_ipv6_rx(true);
+
+    let (state, mut rx_runner, mut tx_runner) = enet.borrow_split();
+    state.set_link_state(LinkState::Up);
+
+    let rx = async {
+        loop {
+            let _ = ot.wait_rx_available().await;
+            let buf = rx_runner.rx_buf().await;
+            if let Ok(len) = ot.rx(buf).await {
+                rx_runner.rx_done(len);
+            }
+        }
+    };
+    let tx = async {
+        loop {
+            let buf = tx_runner.tx_buf().await;
+            if let Err(e) = ot.tx(buf) {
+                warn!("Dropping an IPv6 packet from embassy-net: {:?}", e);
+            }
+            tx_runner.tx_done();
+        }
+    };
+
+    match select3(ot.run(radio), rx, tx).await {
+        Either3::First(r) | Either3::Second(r) | Either3::Third(r) => r,
+    }
+}
+
 /// Starts out data-polling; `run_icd` switches to CSL once the radio is up, if it can.
 fn configure_sed(ot: &OpenThread<'_>, icd: &Icd) -> Result<(), Error> {
     let params = icd.net_params();

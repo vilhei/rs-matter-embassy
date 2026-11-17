@@ -208,6 +208,9 @@ rp235xa = ["embassy-rp/rp235xa"]
 rp235xb = ["embassy-rp/rp235xb"]
 nrf = ["embassy-nrf", "nrf-sdc", "nrf-mpsl", "nrf-802154", "portable-atomic"]
 openthread = ["dep:openthread"]
+# Hand the IPv6 packets OpenThread does not consume itself to an `embassy-net` stack of the
+# application (`EmbassyThread::with_enet`), e.g. for TCP sockets next to Matter.
+openthread-enet = ["openthread", "embassy-net-driver-channel"]
 # Build OpenThread as a Full Thread Device (router-capable) rather than the
 # default Minimal Thread Device. Enables the route-table diagnostics and the
 # router-eligible (REED) routing-role refinement in the `ThreadDiag` impl.
